@@ -1,7 +1,7 @@
-discord.py
+discord.py[voice]
 python-dotenv
 better-profanity
-yt-dlp
+yt-dlp[default]
 imageio-ffmpeg
 Flask
-PyNaCl
+Pillow

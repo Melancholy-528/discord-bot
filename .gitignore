@@ -8,3 +8,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+bot_stats.sqlite3
+bot_stats.sqlite3-shm
+bot_stats.sqlite3-wal
