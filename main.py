@@ -10,6 +10,8 @@ import os
 import random
 import asyncio
 import yt_dlp
+import imageio_ffmpeg
+from collections import deque
 from discord import app_commands
 
 load_dotenv()
@@ -304,61 +306,242 @@ async def fetch(ctx, user: discord.User = None):
 
 
 YTDL_OPTIONS = {"format": "bestaudio/best", "noplaylist": True, "default_search": "ytsearch", "quiet": True}
-FFMPEG_OPTIONS = {"before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", "options": "-vn"}
+FFMPEG_OPTIONS = {
+    "executable": imageio_ffmpeg.get_ffmpeg_exe(),
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
+}
+music_states = {}
 
 
-@bot.hybrid_command(name="music", description="Play, pause, resume, skip, or stop music in your voice channel")
-@app_commands.describe(action="Playback action", query="Song name or URL (for play)")
+def get_music_state(guild_id):
+    return music_states.setdefault(guild_id, {
+        "queue": deque(), "history": [], "current": None, "offset": 0,
+        "started_at": None, "text_channel_id": None, "suppress_after": False,
+    })
+
+
+def format_duration(seconds):
+    if not seconds:
+        return "Live / unknown length"
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def now_playing_embed(state):
+    track = state["current"]
+    if not track:
+        return discord.Embed(title="Nothing is playing", color=discord.Color.blurple())
+    embed = discord.Embed(
+        title="🎶 Now playing",
+        description=f"[{discord.utils.escape_markdown(track['title'])}]({track['webpage_url']})",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Duration", value=format_duration(track.get("duration")), inline=True)
+    embed.add_field(name="Requested by", value=track["requester"], inline=True)
+    if track.get("thumbnail"):
+        embed.set_thumbnail(url=track["thumbnail"])
+    return embed
+
+
+async def post_now_playing(guild_id):
+    state = get_music_state(guild_id)
+    channel = bot.get_channel(state["text_channel_id"])
+    if channel:
+        await channel.send(embed=now_playing_embed(state))
+
+
+async def start_music_track(guild_id, track, record_history=True, refresh_stream=False):
+    guild = bot.get_guild(guild_id)
+    state = get_music_state(guild_id)
+    voice = guild.voice_client if guild else None
+    if not voice or not track:
+        return
+    if record_history and state["current"]:
+        state["history"].append(state["current"])
+    if refresh_stream:
+        track = await extract_track(track["webpage_url"], track["requester"])
+    state["current"] = track
+    offset = max(0, int(state["offset"]))
+    before_options = FFMPEG_OPTIONS["before_options"]
+    if offset:
+        before_options = f"-ss {offset} {before_options}"
+    source = discord.FFmpegPCMAudio(
+        track["stream_url"], executable=FFMPEG_OPTIONS["executable"],
+        before_options=before_options, options=FFMPEG_OPTIONS["options"],
+    )
+    state["offset"] = offset
+    state["started_at"] = asyncio.get_running_loop().time()
+
+    def after_playback(error):
+        if state["suppress_after"]:
+            state["suppress_after"] = False
+            return
+        future = asyncio.run_coroutine_threadsafe(advance_music(guild_id), bot.loop)
+        try:
+            future.result()
+        except Exception as callback_error:
+            print(f"Music queue callback failed: {callback_error}")
+
+    voice.play(source, after=after_playback)
+    await post_now_playing(guild_id)
+
+
+async def advance_music(guild_id):
+    state = get_music_state(guild_id)
+    state["current"] = None
+    state["offset"] = 0
+    state["started_at"] = None
+    while state["queue"]:
+        try:
+            await start_music_track(guild_id, state["queue"].popleft(), refresh_stream=True)
+            return
+        except Exception as error:
+            print(f"Skipping unavailable queued track: {error}")
+    await post_now_playing(guild_id)
+
+
+async def extract_track(query, requester):
+    loop = asyncio.get_running_loop()
+    def extract():
+        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if "entries" in info:
+                info = next((entry for entry in info["entries"] if entry), None)
+            if not info:
+                raise ValueError("No playable result found")
+            return {
+                "title": info.get("title", query),
+                "stream_url": info["url"],
+                "webpage_url": info.get("webpage_url", query),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail"),
+                "requester": requester,
+            }
+    return await loop.run_in_executor(None, extract)
+
+
+@bot.hybrid_command(name="music", description="Play music and manage the server queue")
+@app_commands.describe(action="Playback or queue action", query="Song name or URL")
 @app_commands.choices(action=[
-    app_commands.Choice(name="Play", value="play"), app_commands.Choice(name="Pause", value="pause"),
-    app_commands.Choice(name="Resume", value="resume"), app_commands.Choice(name="Skip", value="skip"),
-    app_commands.Choice(name="Stop", value="stop"),
+    app_commands.Choice(name="Play (or queue)", value="play"),
+    app_commands.Choice(name="Add to queue", value="add"),
+    app_commands.Choice(name="Show queue", value="queue"),
+    app_commands.Choice(name="Now playing", value="now"),
+    app_commands.Choice(name="Skip", value="skip"),
+    app_commands.Choice(name="Previous track", value="previous"),
+    app_commands.Choice(name="Back 10 seconds", value="back"),
+    app_commands.Choice(name="Forward 10 seconds", value="forward"),
+    app_commands.Choice(name="Pause", value="pause"),
+    app_commands.Choice(name="Resume", value="resume"),
+    app_commands.Choice(name="Stop and clear queue", value="stop"),
 ])
 async def music(ctx, action: str, *, query: str = ""):
     if not ctx.guild:
         await ctx.send("Music commands work in a server voice channel.")
         return
+    guild_id = ctx.guild.id
+    state = get_music_state(guild_id)
     voice = ctx.guild.voice_client
-    if action == "play":
+
+    if action in {"play", "add"}:
         if not query:
-            await ctx.send("Give me a song name or URL to play.")
+            await ctx.send("Give me a song name or URL.")
             return
         if not ctx.author.voice or not ctx.author.voice.channel:
             await ctx.send("Join a voice channel first.")
             return
-        await ctx.defer()
+        if ctx.interaction:
+            await ctx.defer()
         try:
             if voice is None:
                 voice = await ctx.author.voice.channel.connect()
             elif voice.channel != ctx.author.voice.channel:
                 await voice.move_to(ctx.author.voice.channel)
-            loop = asyncio.get_running_loop()
-            with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-                info = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
-            if "entries" in info:
-                info = info["entries"][0]
-            source = discord.FFmpegPCMAudio(info["url"], **FFMPEG_OPTIONS)
-            if voice.is_playing() or voice.is_paused():
-                await ctx.send("Already playing something. Pause, skip, or stop it first.")
-                source.cleanup()
-                return
-            voice.play(source)
-            await ctx.send(f"🎶 Now playing **{discord.utils.escape_markdown(info.get('title', query))}**")
+            track = await extract_track(query, ctx.author.display_name)
+            state["text_channel_id"] = ctx.channel.id
+            if action == "add" or voice.is_playing() or voice.is_paused():
+                state["queue"].append(track)
+                pos = len(state["queue"])
+                await ctx.send(f"Added **{discord.utils.escape_markdown(track['title'])}** to the queue (#{pos}).")
+            else:
+                state["offset"] = 0
+                await start_music_track(guild_id, track)
+                await ctx.send(embed=now_playing_embed(state))
         except Exception as error:
-            await ctx.send(f"Couldn't play that track. Check yt-dlp and FFmpeg are installed. ({type(error).__name__})")
+            await ctx.send(f"Couldn't load that track ({type(error).__name__}). Make sure yt-dlp can access it.")
         return
-    if voice is None:
-        await ctx.send("I'm not playing anything right now.")
-    elif action == "pause" and voice.is_playing():
-        voice.pause(); await ctx.send("⏸️ Paused.")
-    elif action == "resume" and voice.is_paused():
-        voice.resume(); await ctx.send("▶️ Resumed.")
-    elif action == "skip" and (voice.is_playing() or voice.is_paused()):
-        voice.stop(); await ctx.send("⏭️ Skipped. (No queue is active.)")
-    elif action == "stop":
+
+    if action == "queue":
+        lines = [f"**Now:** {state['current']['title']}" if state["current"] else "**Now:** Nothing playing"]
+        lines.extend(f"{index}. {track['title']} — {format_duration(track.get('duration'))}" for index, track in enumerate(state["queue"], 1))
+        description = "\n".join(lines)
+        if len(description) > 4000:
+            description = description[:3990] + "…"
+        await ctx.send(embed=discord.Embed(title="🎵 Music queue", description=description, color=discord.Color.blurple()))
+        return
+    if action == "now":
+        await ctx.send(embed=now_playing_embed(state))
+        return
+    if action == "skip":
+        if voice and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+            await ctx.send("⏭️ Skipped.")
+        else:
+            await ctx.send("Nothing is playing to skip.")
+        return
+    if action == "previous":
+        if not state["history"]:
+            await ctx.send("There isn't a previous track in the history yet.")
+            return
+        previous_track = state["history"].pop()
+        if state["current"]:
+            state["queue"].appendleft(state["current"])
+        state["suppress_after"] = bool(voice and (voice.is_playing() or voice.is_paused()))
+        if voice and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+        state["offset"] = 0
+        await start_music_track(guild_id, previous_track, record_history=False, refresh_stream=True)
+        await ctx.send("⏮️ Playing the previous track.")
+        return
+    if action in {"back", "forward"}:
+        if not state["current"] or not voice or not (voice.is_playing() or voice.is_paused()):
+            await ctx.send("Nothing is playing to seek.")
+            return
+        elapsed = state["offset"]
+        if voice.is_playing() and state["started_at"] is not None:
+            elapsed += asyncio.get_running_loop().time() - state["started_at"]
+        delta = -10 if action == "back" else 10
+        duration = state["current"].get("duration")
+        new_offset = max(0, int(elapsed + delta))
+        if duration:
+            new_offset = min(new_offset, max(0, int(duration) - 2))
+        state["offset"] = new_offset
+        current = state["current"]
+        state["suppress_after"] = True
         voice.stop()
-        await voice.disconnect()
-        await ctx.send("⏹️ Stopped and left voice chat.")
+        await start_music_track(guild_id, current, record_history=False)
+        await ctx.send(f"⏪ Moved to {format_duration(new_offset)}.")
+        return
+    if action == "pause" and voice and voice.is_playing():
+        state["offset"] += int(asyncio.get_running_loop().time() - state["started_at"])
+        state["started_at"] = None
+        voice.pause()
+        await ctx.send("⏸️ Paused.")
+    elif action == "resume" and voice and voice.is_paused():
+        state["started_at"] = asyncio.get_running_loop().time()
+        voice.resume()
+        await ctx.send("▶️ Resumed.")
+    elif action == "stop":
+        state["queue"].clear()
+        state["current"] = None
+        state["history"].clear()
+        state["offset"] = 0
+        state["suppress_after"] = bool(voice and (voice.is_playing() or voice.is_paused()))
+        if voice:
+            voice.stop()
+            await voice.disconnect()
+        await ctx.send("⏹️ Stopped playback and cleared the queue.")
     else:
         await ctx.send("That action isn't available for the current playback state.")
 
