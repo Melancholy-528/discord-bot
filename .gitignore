@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+*cookies*.txt
 
 # Python cache and virtual environments
 __pycache__/

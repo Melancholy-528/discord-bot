@@ -809,6 +809,9 @@ async def fetch(ctx, user: discord.User = None):
 
 
 YTDL_OPTIONS = {"format": "bestaudio/best", "noplaylist": True, "default_search": "ytsearch", "quiet": True}
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt")
+if os.path.isfile(YOUTUBE_COOKIES_FILE):
+    YTDL_OPTIONS["cookiefile"] = YOUTUBE_COOKIES_FILE
 SYSTEM_FFMPEG = shutil.which("ffmpeg")
 FFMPEG_OPTIONS = {
     # Prefer the host's FFmpeg build; use the bundled binary if FFmpeg isn't installed.
@@ -973,7 +976,11 @@ async def add_music_request(ctx, query):
         elif isinstance(error, RuntimeError) and "davey" in str(error).lower():
             message = "Voice support is missing davey. Install the requirements with `python -m pip install -U -r req.txt`."
         elif stage == "looking up the track with yt-dlp":
-            message = "yt-dlp couldn't resolve that track. For YouTube, check that Deno 2.3+ is installed."
+            error_text = str(error).lower()
+            if "sign in to confirm" in error_text or "cookies" in error_text:
+                message = "YouTube requires an authenticated session for this track. Configure a private YouTube cookies file on the bot host; never share or commit that file."
+            else:
+                message = "yt-dlp couldn't resolve that track. Check that Deno 2.3+ is installed and review the bot log for details."
         else:
             message = f"Couldn't load the track while {stage} ({type(error).__name__}). See the bot log for details."
         await ctx.send(message)
