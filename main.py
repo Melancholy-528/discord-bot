@@ -810,6 +810,11 @@ async def fetch(ctx, user: discord.User = None):
 
 
 YTDL_OPTIONS = {"format": "bestaudio/best", "noplaylist": True, "default_search": "ytsearch", "quiet": True}
+_deno_path = shutil.which("deno") or os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno")
+if os.path.isfile(_deno_path):
+    YTDL_OPTIONS["js_runtimes"] = {"deno": {"path": _deno_path}}
+YTDL_OPTIONS["remote_components"] = {"ejs:npm"}
+YTDL_OPTIONS["sleep_interval_requests"] = 1.5
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt")
 if os.path.isfile(YOUTUBE_COOKIES_FILE):
     YTDL_OPTIONS["cookiefile"] = YOUTUBE_COOKIES_FILE
@@ -824,6 +829,8 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 music_states = {}
+youtube_lookup_lock = asyncio.Lock()
+last_youtube_lookup = 0.0
 
 
 def get_music_state(guild_id):
@@ -922,6 +929,7 @@ async def advance_music(guild_id):
 
 
 async def extract_track(query, requester):
+    global last_youtube_lookup
     loop = asyncio.get_running_loop()
     def extract():
         options = YTDL_OPTIONS.copy()
@@ -953,7 +961,17 @@ async def extract_track(query, requester):
                     os.remove(temporary_cookies)
                 except FileNotFoundError:
                     pass
-    return await loop.run_in_executor(None, extract)
+    # Serialize lookups and leave breathing room between searches so multiple
+    # queued requests do not immediately amplify YouTube's rate limiting.
+    async with youtube_lookup_lock:
+        now = loop.time()
+        wait_for = 4.0 - (now - last_youtube_lookup)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        try:
+            return await loop.run_in_executor(None, extract)
+        finally:
+            last_youtube_lookup = loop.time()
 
 
 async def add_music_request(ctx, query):
@@ -996,7 +1014,9 @@ async def add_music_request(ctx, query):
             message = "Voice support is missing davey. Install the requirements with `python -m pip install -U -r req.txt`."
         elif stage == "looking up the track with yt-dlp":
             error_text = str(error).lower()
-            if "requested format is not available" in error_text:
+            if "429" in error_text or "too many requests" in error_text:
+                message = "YouTube is rate-limiting the bot host (HTTP 429). Wait before trying again; repeated requests or retries can extend the block."
+            elif "requested format is not available" in error_text:
                 message = "YouTube did not expose an audio format for this track through its current player clients. Try another track; this video may not be playable from the bot host right now."
             elif "page needs to be reloaded" in error_text:
                 message = "YouTube rejected this request. Check that Render deployed the latest bot and yt-dlp nightly, then try again. If it persists, refresh the YouTube cookies secret; YouTube may block some tracks or hosting IPs."
