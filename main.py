@@ -815,7 +815,7 @@ if os.path.isfile(YOUTUBE_COOKIES_FILE):
     YTDL_OPTIONS["cookiefile"] = YOUTUBE_COOKIES_FILE
     # YouTube's tv_downgraded client can fail with "The page needs to be
     # reloaded" for logged-in requests. Prefer the currently working clients.
-    YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": ["default", "web_embedded"]}}
+    YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": ["web_embedded"]}}
 SYSTEM_FFMPEG = shutil.which("ffmpeg")
 FFMPEG_OPTIONS = {
     # Prefer the host's FFmpeg build; use the bundled binary if FFmpeg isn't installed.
@@ -997,7 +997,7 @@ async def add_music_request(ctx, query):
         elif stage == "looking up the track with yt-dlp":
             error_text = str(error).lower()
             if "page needs to be reloaded" in error_text:
-                message = "YouTube rejected this playback client. The bot now retries with alternate clients; if it continues, update the YouTube cookies secret with a fresh export and redeploy."
+                message = "YouTube rejected this request. Check that Render deployed the latest bot and yt-dlp nightly, then try again. If it persists, refresh the YouTube cookies secret; YouTube may block some tracks or hosting IPs."
             elif "sign in to confirm" in error_text or "cookies" in error_text:
                 message = "YouTube requires an authenticated session for this track. Configure a private YouTube cookies file on the bot host; never share or commit that file."
             else:

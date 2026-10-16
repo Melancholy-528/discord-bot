@@ -3,7 +3,7 @@ services:
     name: discord-bot
     runtime: python
     plan: free
-    buildCommand: pip install -r req.txt && curl -fsSL https://deno.land/install.sh | DENO_INSTALL="$HOME/.deno" sh
+    buildCommand: pip install -r req.txt && pip install --pre --upgrade "yt-dlp[default]" && curl -fsSL https://deno.land/install.sh | DENO_INSTALL="$HOME/.deno" sh
     startCommand: export PATH="$HOME/.deno/bin:$PATH"; python main.py
     healthCheckPath: /ping
     envVars:
