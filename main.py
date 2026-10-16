@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from better_profanity import profanity
 from flask import Flask
+from waitress import serve
 from threading import Thread
 import os
 import random
@@ -53,7 +54,7 @@ def ping():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    serve(app, host="0.0.0.0", port=port)
 
 Thread(target=run_web, daemon=True).start()
 
@@ -398,13 +399,14 @@ async def on_message(message: discord.Message):
         author_key = (message.guild.id, message.author.id)
         if author_key in afk_users:
             afk_users.pop(author_key, None)
-            await message.reply("welcome back! your AFK status is cleared ✨", mention_author=False)
+            await message.reply("welcome back! your AFK status is cleared ✨", mention_author=False, delete_after=10)
         for mentioned in message.mentions:
             afk = afk_users.get((message.guild.id, mentioned.id))
             if afk:
                 await message.channel.send(
                     f"{mentioned.mention} is AFK: {discord.utils.escape_mentions(afk)}",
-                    allowed_mentions=discord.AllowedMentions(users=[message.author])
+                    allowed_mentions=discord.AllowedMentions(users=[message.author]),
+                    delete_after=10,
                 )
 
     if bot.user.mentioned_in(message):
@@ -494,14 +496,14 @@ async def snipe(ctx):
 @bot.hybrid_command(name="afk", description="Set or clear your AFK status")
 async def afk(ctx, *, reason: str = "AFK"):
     if not ctx.guild:
-        await ctx.send("AFK status works in servers.")
+        await ctx.send("AFK status works in servers.", delete_after=10)
         return
     if reason.strip().lower() in {"off", "clear", "back"}:
         afk_users.pop((ctx.guild.id, ctx.author.id), None)
-        await ctx.send("welcome back! your AFK status is cleared ✨")
+        await ctx.send("welcome back! your AFK status is cleared ✨", delete_after=10)
         return
     afk_users[(ctx.guild.id, ctx.author.id)] = reason[:200]
-    await ctx.send(f"{ctx.author.mention} is now AFK: {discord.utils.escape_mentions(reason[:200])}")
+    await ctx.send(f"{ctx.author.mention} is now AFK: {discord.utils.escape_mentions(reason[:200])}", delete_after=10)
     if ctx.interaction is None:
         await ctx.message.add_reaction("💤")
 

@@ -4,4 +4,5 @@ better-profanity
 yt-dlp[default]
 imageio-ffmpeg
 Flask
+waitress
 Pillow
