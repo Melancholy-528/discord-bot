@@ -813,6 +813,9 @@ YTDL_OPTIONS = {"format": "bestaudio/best", "noplaylist": True, "default_search"
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt")
 if os.path.isfile(YOUTUBE_COOKIES_FILE):
     YTDL_OPTIONS["cookiefile"] = YOUTUBE_COOKIES_FILE
+    # YouTube's tv_downgraded client can fail with "The page needs to be
+    # reloaded" for logged-in requests. Prefer the currently working clients.
+    YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": ["default", "web_embedded"]}}
 SYSTEM_FFMPEG = shutil.which("ffmpeg")
 FFMPEG_OPTIONS = {
     # Prefer the host's FFmpeg build; use the bundled binary if FFmpeg isn't installed.
@@ -993,7 +996,9 @@ async def add_music_request(ctx, query):
             message = "Voice support is missing davey. Install the requirements with `python -m pip install -U -r req.txt`."
         elif stage == "looking up the track with yt-dlp":
             error_text = str(error).lower()
-            if "sign in to confirm" in error_text or "cookies" in error_text:
+            if "page needs to be reloaded" in error_text:
+                message = "YouTube rejected this playback client. The bot now retries with alternate clients; if it continues, update the YouTube cookies secret with a fresh export and redeploy."
+            elif "sign in to confirm" in error_text or "cookies" in error_text:
                 message = "YouTube requires an authenticated session for this track. Configure a private YouTube cookies file on the bot host; never share or commit that file."
             else:
                 message = "yt-dlp couldn't resolve that track. Check that Deno 2.3+ is installed and review the bot log for details."
