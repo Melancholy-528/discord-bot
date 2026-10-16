@@ -11,6 +11,7 @@ import os
 import random
 import math
 import asyncio
+import tempfile
 import shutil
 import re
 import io
@@ -920,20 +921,35 @@ async def advance_music(guild_id):
 async def extract_track(query, requester):
     loop = asyncio.get_running_loop()
     def extract():
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            info = ydl.extract_info(query, download=False)
-            if "entries" in info:
-                info = next((entry for entry in info["entries"] if entry), None)
-            if not info:
-                raise ValueError("No playable result found")
-            return {
-                "title": info.get("title", query),
-                "stream_url": info["url"],
-                "webpage_url": info.get("webpage_url", query),
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail"),
-                "requester": requester,
-            }
+        options = YTDL_OPTIONS.copy()
+        source_cookies = options.get("cookiefile")
+        temporary_cookies = None
+        try:
+            if source_cookies:
+                fd, temporary_cookies = tempfile.mkstemp(prefix="yt-dlp-cookies-", suffix=".txt")
+                os.close(fd)
+                shutil.copyfile(source_cookies, temporary_cookies)
+                options["cookiefile"] = temporary_cookies
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if "entries" in info:
+                    info = next((entry for entry in info["entries"] if entry), None)
+                if not info:
+                    raise ValueError("No playable result found")
+                return {
+                    "title": info.get("title", query),
+                    "stream_url": info["url"],
+                    "webpage_url": info.get("webpage_url", query),
+                    "duration": info.get("duration"),
+                    "thumbnail": info.get("thumbnail"),
+                    "requester": requester,
+                }
+        finally:
+            if temporary_cookies:
+                try:
+                    os.remove(temporary_cookies)
+                except FileNotFoundError:
+                    pass
     return await loop.run_in_executor(None, extract)
 
 
