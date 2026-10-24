@@ -1,12 +1,10 @@
 import discord
+import atexit
 from discord.ext import commands
 import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from better_profanity import profanity
-from flask import Flask
-from waitress import serve
-from threading import Thread
 import os
 import random
 import math
@@ -15,6 +13,7 @@ import tempfile
 import shutil
 import re
 import io
+import struct
 import sqlite3
 import yt_dlp
 import imageio_ffmpeg
@@ -26,12 +25,6 @@ load_dotenv()
 
 token = os.getenv("DISCORD_TOKEN")
 
-handler = logging.FileHandler(
-    filename="discord.log",
-    encoding="utf-8",
-    mode="w"
-)
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -40,24 +33,8 @@ intents.presences = True
 intents.voice_states = True
 intents.guilds = True
 
-bot = commands.Bot(command_prefix="$", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!", "$"), intents=intents, help_command=None)
 afk_users = {}
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot is alive"
-
-@app.route("/ping")
-def ping():
-    return "OK"
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    serve(app, host="0.0.0.0", port=port)
-
-Thread(target=run_web, daemon=True).start()
 
 sniped_messages = {}
 warnings_by_guild = {}
@@ -167,6 +144,46 @@ async def generate_sarcastic_reply(user_message: str):
         " please rethink that."
     ])
     return base + extra_twist
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    original = getattr(error, "original", error)
+    logging.error(
+        "Slash command %s failed: %s",
+        getattr(interaction.command, "name", "unknown"), original,
+        exc_info=(type(original), original, original.__traceback__),
+    )
+    message = "That command ran into an error. Please try again; the bot logged the details."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        logging.exception("Could not send the slash-command error response")
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        command_name = ctx.command.qualified_name if ctx.command else "command"
+        if command_name == "purge":
+            message = "Usage: `!purge <amount>` — choose how many messages to delete (1–100)."
+        else:
+            message = f"Missing a required argument. Use `!help` to see command examples."
+        await ctx.send(message, delete_after=12)
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("I couldn't understand one of those arguments. Check the command options and try again.", delete_after=12)
+        return
+    logging.error("Prefix command failed", exc_info=(type(error), error, error.__traceback__))
+    try:
+        await ctx.send("That command ran into an error. Please try again.", delete_after=12)
+    except discord.HTTPException:
+        pass
+
 
 @bot.event
 async def on_ready():
@@ -681,6 +698,211 @@ class MathAnswerView(discord.ui.View):
         return callback
 
 
+class DuelInviteView(discord.ui.View):
+    def __init__(self, challenger, opponent, game):
+        super().__init__(timeout=120)
+        self.challenger = challenger
+        self.opponent = opponent
+        self.game = game
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message(
+                f"Only {self.opponent.mention} can answer this challenge.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Accept", emoji="🎮", style=discord.ButtonStyle.success)
+    async def accept(self, interaction, button):
+        if self.game == "tictactoe":
+            view = TicTacToeView(self.challenger, self.opponent)
+            embed = view.make_embed("It’s your turn, " + self.challenger.display_name + "!")
+        else:
+            view = RockPaperScissorsView(self.challenger, self.opponent)
+            embed = view.make_embed()
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        view.message = interaction.message
+
+    @discord.ui.button(label="Decline", emoji="✋", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction, button):
+        await interaction.response.edit_message(
+            content=f"{self.opponent.mention} declined the challenge.", embed=None, view=None
+        )
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="Challenge expired.", view=self)
+            except discord.HTTPException:
+                pass
+
+
+class TicTacToeView(discord.ui.View):
+    WIN_LINES = ((0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7),
+                 (2, 5, 8), (0, 4, 8), (2, 4, 6))
+
+    def __init__(self, player_x, player_o):
+        super().__init__(timeout=600)
+        self.players = {"❌": player_x, "⭕": player_o}
+        self.board = [None] * 9
+        self.turn = "❌"
+        self.finished = False
+        self.message = None
+        for position in range(9):
+            button = discord.ui.Button(label="▫️", style=discord.ButtonStyle.secondary,
+                                       row=position // 3)
+            button.callback = self.make_move_callback(position, button)
+            self.add_item(button)
+
+    def make_embed(self, status):
+        cells = [mark or "▫️" for mark in self.board]
+        board = "\n".join("　".join(cells[row:row + 3]) for row in (0, 3, 6))
+        embed = discord.Embed(title="⭕ Tic-tac-toe", description=board,
+                              color=discord.Color.from_rgb(119, 211, 255))
+        embed.add_field(name="Players", value=f"❌ {self.players['❌'].mention}\n⭕ {self.players['⭕'].mention}", inline=True)
+        embed.add_field(name="Turn", value=status, inline=True)
+        return embed
+
+    def make_move_callback(self, position, button):
+        async def callback(interaction):
+            if self.finished:
+                await interaction.response.send_message("This game has ended.", ephemeral=True)
+                return
+            if interaction.user.id != self.players[self.turn].id:
+                await interaction.response.send_message("It’s not your turn.", ephemeral=True)
+                return
+            if self.board[position]:
+                await interaction.response.send_message("That square is already taken.", ephemeral=True)
+                return
+            mark = self.turn
+            self.board[position] = mark
+            button.label = mark
+            button.emoji = None
+            button.style = discord.ButtonStyle.danger if mark == "❌" else discord.ButtonStyle.primary
+            button.disabled = True
+            winner = None
+            for line in self.WIN_LINES:
+                if all(self.board[index] == mark for index in line):
+                    winner = mark
+                    break
+            if winner:
+                self.finished = True
+                for child in self.children:
+                    child.disabled = True
+                embed = self.make_embed(f"🏆 {self.players[winner].mention} wins!")
+                embed.color = discord.Color.green()
+            elif all(self.board):
+                self.finished = True
+                for child in self.children:
+                    child.disabled = True
+                embed = self.make_embed("🤝 It’s a draw!")
+            else:
+                self.turn = "⭕" if mark == "❌" else "❌"
+                embed = self.make_embed(f"{self.players[self.turn].mention}, your move!")
+            await interaction.response.edit_message(embed=embed, view=self)
+        return callback
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="This game expired.", view=self)
+            except discord.HTTPException:
+                pass
+
+
+class RockPaperScissorsView(discord.ui.View):
+    MOVES = ("rock", "paper", "scissors")
+    EMOJIS = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
+
+    def __init__(self, player_one, player_two):
+        super().__init__(timeout=180)
+        self.players = (player_one, player_two)
+        self.choices = {}
+        self.message = None
+        for move, emoji in self.EMOJIS.items():
+            button = discord.ui.Button(label=move.title(), emoji=emoji,
+                                       style=discord.ButtonStyle.secondary)
+            button.callback = self.make_choice_callback(move)
+            self.add_item(button)
+
+    def make_embed(self, status="Both players: choose your move (your choice stays hidden)."):
+        embed = discord.Embed(title="✊ Rock, paper, scissors",
+                              description=status, color=discord.Color.from_rgb(255, 111, 145))
+        embed.add_field(name="Players", value=f"{self.players[0].mention} vs {self.players[1].mention}")
+        return embed
+
+    def make_choice_callback(self, move):
+        async def callback(interaction):
+            player_id = interaction.user.id
+            if player_id not in {player.id for player in self.players}:
+                await interaction.response.send_message("You aren’t playing this round.", ephemeral=True)
+                return
+            if player_id in self.choices:
+                await interaction.response.send_message("Your move is already locked in.", ephemeral=True)
+                return
+            self.choices[player_id] = move
+            if len(self.choices) < 2:
+                await interaction.response.defer(ephemeral=True)
+                await interaction.followup.send("Your move is locked in 🔒", ephemeral=True)
+                await interaction.message.edit(embed=self.make_embed(
+                    f"{interaction.user.mention} has locked in. Waiting for the other player…"), view=self)
+                return
+
+            first, second = self.players
+            first_move, second_move = self.choices[first.id], self.choices[second.id]
+            if first_move == second_move:
+                result, color = "🤝 It’s a tie!", discord.Color.gold()
+            elif (first_move, second_move) in (("rock", "scissors"), ("paper", "rock"), ("scissors", "paper")):
+                result, color = f"🏆 {first.mention} wins!", discord.Color.green()
+            else:
+                result, color = f"🏆 {second.mention} wins!", discord.Color.green()
+            embed = self.make_embed(result)
+            embed.add_field(name=first.display_name, value=self.EMOJIS[first_move], inline=True)
+            embed.add_field(name=second.display_name, value=self.EMOJIS[second_move], inline=True)
+            embed.color = color
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(embed=embed, view=self)
+            self.stop()
+        return callback
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="This round expired.", view=self)
+            except discord.HTTPException:
+                pass
+
+
+@bot.hybrid_command(name="duel", description="Challenge someone to a two-player game")
+@app_commands.describe(opponent="The server member you want to challenge", game="Pick a game")
+@app_commands.choices(game=[
+    app_commands.Choice(name="Tic-tac-toe", value="tictactoe"),
+    app_commands.Choice(name="Rock paper scissors", value="rps"),
+])
+async def duel(ctx, opponent: discord.Member, game: str):
+    if not ctx.guild:
+        await ctx.send("Duel games can only be started in a server.")
+        return
+    if opponent.bot or opponent.id == ctx.author.id:
+        await ctx.send("Choose another human server member to challenge.")
+        return
+    game_name = "tic-tac-toe" if game == "tictactoe" else "rock, paper, scissors"
+    view = DuelInviteView(ctx.author, opponent, game)
+    message = await ctx.send(
+        f"🎮 {opponent.mention}, {ctx.author.mention} challenged you to **{game_name}**! "
+        "Accept within 2 minutes to play.", view=view
+    )
+    view.message = message
+
+
 @bot.hybrid_command(name="games", description="Play a game and get a custom result card")
 @app_commands.describe(game="Choose a game", choice="Your pick or guess (varies by game)")
 @app_commands.choices(game=[
@@ -794,6 +1016,8 @@ async def games(ctx, game: str, choice: str = ""):
 
 @bot.hybrid_command(name="fetch", description="Show a user's avatar and, when available, banner")
 async def fetch(ctx, user: discord.User = None):
+    if ctx.interaction:
+        await ctx.defer(thinking=True)
     user = user or ctx.author
     try:
         user = await bot.fetch_user(user.id)
@@ -809,25 +1033,139 @@ async def fetch(ctx, user: discord.User = None):
     await ctx.send(embed=embed)
 
 
-YTDL_OPTIONS = {"format": "bestaudio/best", "noplaylist": True, "default_search": "ytsearch", "quiet": True}
+YTDL_OPTIONS = {
+    "format": "bestaudio/best", "noplaylist": True, "default_search": "ytsearch",
+    "quiet": True, "noprogress": True,
+}
+_js_runtimes = {}
 _deno_path = shutil.which("deno") or os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno")
-if os.path.isfile(_deno_path):
-    YTDL_OPTIONS["js_runtimes"] = {"deno": {"path": _deno_path}}
+for _runtime, _candidates in (
+    ("deno", (_deno_path,)),
+    ("node", (shutil.which("node"),)),
+    ("bun", (shutil.which("bun"),)),
+    ("quickjs", (shutil.which("qjs"), shutil.which("quickjs"))),
+):
+    _runtime_path = next((path for path in _candidates if path and os.path.isfile(path)), None)
+    if _runtime_path:
+        _js_runtimes[_runtime] = {"path": _runtime_path}
+if _js_runtimes:
+    YTDL_OPTIONS["js_runtimes"] = _js_runtimes
 YTDL_OPTIONS["remote_components"] = {"ejs:npm"}
 YTDL_OPTIONS["sleep_interval_requests"] = 1.5
-YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt")
-if os.path.isfile(YOUTUBE_COOKIES_FILE):
-    YTDL_OPTIONS["cookiefile"] = YOUTUBE_COOKIES_FILE
-    # YouTube's tv_downgraded client can fail with "The page needs to be
-    # reloaded" for logged-in requests. Prefer the currently working clients.
-    YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": ["default", "web_embedded"]}}
+print(f"yt-dlp JavaScript runtimes detected: {', '.join(_js_runtimes) if _js_runtimes else 'none'}")
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "youtube-cookies.txt")
+_youtube_cookie_temp_path = None
+
+
+def _remove_youtube_cookie_temp():
+    if _youtube_cookie_temp_path:
+        try:
+            os.remove(_youtube_cookie_temp_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logging.warning("Could not remove temporary YouTube cookies file")
+
+
+def get_ytdl_options():
+    """Build yt-dlp options and copy optional cookies into writable private temp storage."""
+    global _youtube_cookie_temp_path
+    options = YTDL_OPTIONS.copy()
+    cookie_source = os.path.abspath(YOUTUBE_COOKIES_FILE)
+    if os.path.isfile(cookie_source):
+        if _youtube_cookie_temp_path is None:
+            with tempfile.NamedTemporaryFile(prefix="youtube-cookies-", suffix=".txt", delete=False) as temp_cookie:
+                _youtube_cookie_temp_path = temp_cookie.name
+            os.chmod(_youtube_cookie_temp_path, 0o600)
+            shutil.copyfile(cookie_source, _youtube_cookie_temp_path)
+            atexit.register(_remove_youtube_cookie_temp)
+        options["cookiefile"] = _youtube_cookie_temp_path
+    elif os.getenv("YOUTUBE_COOKIES_FILE"):
+        raise FileNotFoundError("YOUTUBE_COOKIES_FILE does not point to an accessible cookies file")
+    return options
+
+
+def extract_info_with_cookie_fallback(query, options, download=False):
+    """Retry a cookie-rejected YouTube lookup anonymously, preserving old behavior."""
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(query, download=download)
+    except yt_dlp.utils.DownloadError as error:
+        error_text = str(error).lower()
+        if not options.get("cookiefile") or "sign in to confirm" not in error_text:
+            raise
+        logging.warning("YouTube rejected the cookie-authenticated request; retrying without cookies")
+        anonymous_options = options.copy()
+        anonymous_options.pop("cookiefile", None)
+        with yt_dlp.YoutubeDL(anonymous_options) as ydl:
+            return ydl.extract_info(query, download=download)
+
+
+# Try the bundled FFmpeg first, then a configured or system build if decoding
+# a specific audio format is unsupported.
 SYSTEM_FFMPEG = shutil.which("ffmpeg")
-FFMPEG_OPTIONS = {
-    # Prefer the host's FFmpeg build; use the bundled binary if FFmpeg isn't installed.
-    "executable": SYSTEM_FFMPEG or imageio_ffmpeg.get_ffmpeg_exe(),
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
+try:
+    BUNDLED_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except RuntimeError:
+    BUNDLED_FFMPEG = None
+FFMPEG_OPTIONS = {"options": "-vn"}
+# Prefer the host FFmpeg: the bundled imageio build crashed with exit -11
+# during earlier playback attempts. Keep the bundled binary as a fallback.
+FFMPEG_CANDIDATES = list(dict.fromkeys(
+    executable for executable in (os.getenv("FFMPEG_BINARY"), SYSTEM_FFMPEG, BUNDLED_FFMPEG)
+    if executable
+))
+logging.info("Music FFmpeg candidates: %s", FFMPEG_CANDIDATES)
+
+
+def read_pcm_probe(source, frame_limit=5):
+    """Read a short PCM sample and report its loudest decoded sample."""
+    frames = []
+    peak = 0
+    for _ in range(frame_limit):
+        frame = source.read()
+        if not frame:
+            break
+        frames.append(frame)
+        peak = max(peak, max((abs(sample[0]) for sample in struct.iter_unpack("<h", frame)), default=0))
+    return frames, peak
+
+
+class BufferedAudioSource(discord.AudioSource):
+    """Replay the PCM frames consumed while checking the remote audio stream."""
+    def __init__(self, source, initial_frames, stderr_log, temp_dir=None):
+        self.source = source
+        self.initial_frames = deque(initial_frames)
+        self.stderr_log = stderr_log
+        self.temp_dir = temp_dir
+        self.read_frames = 0
+
+    def read(self):
+        frame = self.initial_frames.popleft() if self.initial_frames else self.source.read()
+        if frame:
+            self.read_frames += 1
+        return frame
+
+    def is_opus(self):
+        return False
+
+    def cleanup(self):
+        self.source.cleanup()
+        self.stderr_log.close()
+        if self.temp_dir:
+            self.temp_dir.cleanup()
+            self.temp_dir = None
+
+    def error_output(self):
+        try:
+            self.stderr_log.flush()
+            self.stderr_log.seek(0)
+            detail = self.stderr_log.read(4096).decode(errors="replace").strip()
+            return re.sub(r"https?://\S+", "[stream URL]", detail) or "<no FFmpeg details>"
+        except Exception:
+            return "<FFmpeg details unavailable>"
+
+
 music_states = {}
 youtube_lookup_lock = asyncio.Lock()
 last_youtube_lookup = 0.0
@@ -837,7 +1175,7 @@ def get_music_state(guild_id):
     return music_states.setdefault(guild_id, {
         "queue": deque(), "history": [], "current": None, "offset": 0,
         "started_at": None, "text_channel_id": None, "suppress_after": False,
-        "volume": 50, "loop": "off",
+        "volume": 100, "loop": "off", "paused": False,
     })
 
 
@@ -859,6 +1197,7 @@ def now_playing_embed(state):
     )
     embed.add_field(name="Duration", value=format_duration(track.get("duration")), inline=True)
     embed.add_field(name="Requested by", value=track["requester"], inline=True)
+    embed.add_field(name="Status", value="Paused" if state.get("paused") else "Playing", inline=True)
     if track.get("thumbnail"):
         embed.set_thumbnail(url=track["thumbnail"])
     return embed
@@ -868,10 +1207,206 @@ async def post_now_playing(guild_id):
     state = get_music_state(guild_id)
     channel = bot.get_channel(state["text_channel_id"])
     if channel:
-        await channel.send(embed=now_playing_embed(state))
+        view = MusicControlView(guild_id) if state["current"] else None
+        message = await channel.send(embed=now_playing_embed(state), view=view)
+        if view:
+            view.message = message
 
 
-async def start_music_track(guild_id, track, record_history=True, refresh_stream=False):
+class MusicControlView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=7200)
+        self.guild_id = guild_id
+        self.message = None
+
+    async def interaction_check(self, interaction):
+        guild = interaction.guild
+        voice = guild.voice_client if guild else None
+        member_voice = getattr(interaction.user, "voice", None)
+        if (not guild or guild.id != self.guild_id or not voice or not member_voice
+                or member_voice.channel != voice.channel):
+            await interaction.response.send_message(
+                "Join the bot's voice channel to use these controls.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    async def previous_button(self, interaction, button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await previous_music_track(self.guild_id)
+        try:
+            await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(message, ephemeral=True)
+
+    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.secondary, row=0)
+    async def rewind_button(self, interaction, button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await seek_music_state(self.guild_id, -10)
+        try:
+            await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(message, ephemeral=True)
+
+    @discord.ui.button(emoji="⏸️", label="Pause", style=discord.ButtonStyle.primary, row=0)
+    async def pause_button(self, interaction, button):
+        guild = interaction.guild
+        voice = guild.voice_client if guild else None
+        state = get_music_state(self.guild_id)
+        if voice and voice.is_paused():
+            state["started_at"] = asyncio.get_running_loop().time()
+            state["paused"] = False
+            voice.resume()
+            button.label = "Pause"
+            button.emoji = "⏸️"
+        elif voice and voice.is_playing():
+            if state["started_at"] is not None:
+                state["offset"] += int(asyncio.get_running_loop().time() - state["started_at"])
+            state["started_at"] = None
+            state["paused"] = True
+            voice.pause()
+            button.label = "Resume"
+            button.emoji = "▶️"
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=now_playing_embed(state), view=self)
+
+    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.secondary, row=0)
+    async def forward_button(self, interaction, button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await seek_music_state(self.guild_id, 10)
+        try:
+            await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(message, ephemeral=True)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    async def skip_button(self, interaction, button):
+        guild = interaction.guild
+        voice = guild.voice_client if guild else None
+        if voice and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+            await interaction.response.edit_message(content="⏭️ Skipped.", embed=None, view=None)
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+
+    @discord.ui.button(emoji="📜", label="Queue", style=discord.ButtonStyle.secondary, row=1)
+    async def queue_button(self, interaction, button):
+        state = get_music_state(self.guild_id)
+        lines = [f"**Now:** {state['current']['title']}" if state["current"] else "**Now:** Nothing playing"]
+        lines.extend(
+            f"{index}. {track['title']} — {format_duration(track.get('duration'))}"
+            for index, track in enumerate(state["queue"], 1)
+        )
+        description = "\n".join(lines)
+        if len(description) > 4000:
+            description = description[:3990] + "…"
+        embed = discord.Embed(title="🎵 Music queue", description=description, color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(emoji="⏹️", label="Stop", style=discord.ButtonStyle.danger, row=1)
+    async def stop_button(self, interaction, button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await stop_music_state(self.guild_id)
+        try:
+            await interaction.message.edit(embed=now_playing_embed(get_music_state(self.guild_id)), view=None)
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(message, ephemeral=True)
+
+
+def resolve_track_stream(track):
+    """Resolve a fresh direct audio URL immediately before playback."""
+    options = get_ytdl_options()
+    options.update({"format": "bestaudio/best", "skip_download": True, "noplaylist": True})
+    info = extract_info_with_cookie_fallback(track["webpage_url"], options, download=False)
+    if info and "entries" in info:
+        info = next((entry for entry in info["entries"] if entry), None)
+    if not info:
+        raise ValueError("No playable audio stream found")
+    stream_url = info.get("url")
+    if not stream_url:
+        formats = info.get("requested_formats") or info.get("formats") or []
+        audio_formats = [item for item in formats if item.get("acodec") not in (None, "none")]
+        if audio_formats:
+            stream_url = audio_formats[-1].get("url")
+    if not stream_url:
+        raise RuntimeError("yt-dlp did not return a direct audio stream URL")
+    return stream_url, info
+
+
+def download_track_for_cookie_playback(track, options):
+    """Download through yt-dlp when cookies are needed, keeping them out of FFmpeg."""
+    temp_dir = tempfile.TemporaryDirectory(prefix="discord-music-")
+    download_options = options.copy()
+    download_options.update({
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "outtmpl": os.path.join(temp_dir.name, "audio.%(ext)s"),
+        "quiet": True,
+        "noprogress": True,
+    })
+    try:
+        info = extract_info_with_cookie_fallback(
+            track["webpage_url"], download_options, download=True
+        )
+        if info and "entries" in info:
+            info = next((entry for entry in info["entries"] if entry), None)
+        audio_files = [
+            os.path.join(temp_dir.name, name)
+            for name in os.listdir(temp_dir.name)
+            if os.path.isfile(os.path.join(temp_dir.name, name))
+            and not name.endswith((".part", ".ytdl"))
+        ]
+        if not info or not audio_files:
+            raise RuntimeError("yt-dlp completed without creating an audio file")
+        return temp_dir, audio_files[0], info
+    except Exception:
+        temp_dir.cleanup()
+        raise
+
+
+async def resolve_track_stream_async(track):
+    global last_youtube_lookup
+    loop = asyncio.get_running_loop()
+    async with youtube_lookup_lock:
+        wait_for = 4.0 - (loop.time() - last_youtube_lookup)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        try:
+            return await asyncio.to_thread(resolve_track_stream, track)
+        finally:
+            last_youtube_lookup = loop.time()
+
+
+async def download_track_for_cookie_playback_async(track, options):
+    global last_youtube_lookup
+    loop = asyncio.get_running_loop()
+    async with youtube_lookup_lock:
+        wait_for = 4.0 - (loop.time() - last_youtube_lookup)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        try:
+            return await asyncio.to_thread(download_track_for_cookie_playback, track, options)
+        finally:
+            last_youtube_lookup = loop.time()
+
+
+async def start_music_track(guild_id, track, record_history=True):
     guild = bot.get_guild(guild_id)
     state = get_music_state(guild_id)
     voice = guild.voice_client if guild else None
@@ -879,40 +1414,173 @@ async def start_music_track(guild_id, track, record_history=True, refresh_stream
         return
     if record_history and state["current"]:
         state["history"].append(state["current"])
-    if refresh_stream:
-        track = await extract_track(track["webpage_url"], track["requester"])
     state["current"] = track
     offset = max(0, int(state["offset"]))
-    before_options = FFMPEG_OPTIONS["before_options"]
-    if offset:
-        before_options = f"-ss {offset} {before_options}"
-    audio = discord.FFmpegPCMAudio(
-        track["stream_url"], executable=FFMPEG_OPTIONS["executable"],
-        before_options=before_options, options=FFMPEG_OPTIONS["options"],
+    ytdl_options = get_ytdl_options()
+    temp_dir = None
+    if ytdl_options.get("cookiefile"):
+        temp_dir, audio_input, stream_info = await download_track_for_cookie_playback_async(
+            track, ytdl_options
+        )
+        reconnect_options = ""
+        logging.info("Using yt-dlp-managed temporary audio for cookie-authenticated playback")
+    else:
+        audio_input, stream_info = await resolve_track_stream_async(track)
+        reconnect_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    track["title"] = stream_info.get("title") or track["title"]
+    track["duration"] = stream_info.get("duration") or track.get("duration")
+    track["thumbnail"] = stream_info.get("thumbnail") or track.get("thumbnail")
+    before_options = " ".join(part for part in (
+        reconnect_options, f"-ss {offset}" if offset else ""
+    ) if part)
+    audio_options = FFMPEG_OPTIONS["options"]
+    audio = None
+    ffmpeg_stderr = None
+    initial_frames = []
+    probe_peak = 0
+    ffmpeg_executable = None
+    ffmpeg_failures = []
+    logging.info("Music audio resolved format=%s protocol=%s", stream_info.get("ext"), stream_info.get("protocol"))
+    for candidate in FFMPEG_CANDIDATES:
+        candidate_stderr = tempfile.TemporaryFile()
+        candidate_audio = None
+        try:
+            candidate_audio = discord.FFmpegPCMAudio(
+                audio_input, executable=candidate, before_options=before_options,
+                options=audio_options, stderr=candidate_stderr,
+            )
+            read_task = asyncio.create_task(asyncio.to_thread(read_pcm_probe, candidate_audio))
+            read_task.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None
+            )
+            try:
+                candidate_frames, candidate_peak = await asyncio.wait_for(asyncio.shield(read_task), timeout=15)
+            except asyncio.TimeoutError:
+                candidate_audio._process.kill()
+                candidate_stderr.flush()
+                candidate_stderr.seek(0)
+                detail = candidate_stderr.read(4096).decode(errors="replace").strip()
+                detail = re.sub(r"https?://\S+", "[stream URL]", detail) or "<no FFmpeg details>"
+                candidate_audio._stopped = True
+                try:
+                    candidate_audio._stdout.close()
+                except Exception:
+                    pass
+                candidate_audio._process.poll()
+                ffmpeg_failures.append(f"{candidate} timed out waiting for audio: {detail}")
+                candidate_stderr.close()
+                continue
+            if candidate_frames:
+                audio, ffmpeg_stderr = candidate_audio, candidate_stderr
+                initial_frames, probe_peak = candidate_frames, candidate_peak
+                ffmpeg_executable = candidate
+                break
+            return_code = candidate_audio._process.poll()
+            candidate_stderr.flush()
+            candidate_stderr.seek(0)
+            detail = candidate_stderr.read(4096).decode(errors="replace").strip()
+            detail = re.sub(r"https?://\S+", "[stream URL]", detail)
+            ffmpeg_failures.append(f"{candidate} exit {return_code}: {detail or '<no FFmpeg details>'}")
+            candidate_audio.cleanup()
+            candidate_stderr.close()
+            logging.warning("FFmpeg %s returned no audio (exit %s): %s", candidate, return_code, detail)
+        except Exception as error:
+            ffmpeg_failures.append(f"{candidate}: {type(error).__name__}: {error}")
+            if candidate_audio is not None:
+                try:
+                    candidate_audio.cleanup()
+                except Exception:
+                    pass
+            candidate_stderr.close()
+    if not initial_frames:
+        if temp_dir:
+            temp_dir.cleanup()
+        raise RuntimeError("No FFmpeg build produced audio frames. " + " | ".join(ffmpeg_failures))
+    logging.warning(
+        "Music diagnostic: FFmpeg decoded audio probe_frames=%d duration=%.2fs peak=%d executable=%s",
+        len(initial_frames), len(initial_frames) * 0.02, probe_peak, ffmpeg_executable,
     )
-    source = discord.PCMVolumeTransformer(audio, volume=state["volume"] / 100)
+    buffered_source = BufferedAudioSource(audio, initial_frames, ffmpeg_stderr, temp_dir=temp_dir)
+    source = discord.PCMVolumeTransformer(buffered_source, volume=state["volume"] / 100)
     state["offset"] = offset
+    state["paused"] = False
     state["started_at"] = asyncio.get_running_loop().time()
 
     def after_playback(error):
         if state["suppress_after"]:
             state["suppress_after"] = False
             return
+        sent_frames = getattr(voice._player, "loops", "unknown")
+        if error:
+            ffmpeg_detail = buffered_source.error_output()
+            logging.error(
+                "Music playback failed for %r using %s after %s voice frames: %s; stderr: %s",
+                track.get("title", "unknown track"), ffmpeg_executable, sent_frames, error, ffmpeg_detail,
+            )
+            state["current"] = None
+            state["started_at"] = None
+            async def report_playback_error():
+                channel = bot.get_channel(state.get("text_channel_id"))
+                if channel:
+                    await channel.send(
+                        "I couldn't play that track. FFmpeg reported: "
+                        f"`{str(error)[:180]}` · `{ffmpeg_detail[:180]}`. Try `/play` again."
+                    )
+                await advance_music(guild_id)
+            future = asyncio.run_coroutine_threadsafe(report_playback_error(), bot.loop)
+            try:
+                future.result()
+            except Exception as callback_error:
+                logging.error("Music queue callback failed after FFmpeg error: %s", callback_error)
+            return
+        logging.warning(
+            "Music track %r ended normally: sent_frames=%s voice_connected=%s channel=%s ffmpeg=%s",
+            track.get("title", "unknown track"), sent_frames, voice.is_connected(),
+            getattr(voice.channel, "id", None), ffmpeg_executable,
+        )
         future = asyncio.run_coroutine_threadsafe(advance_music(guild_id), bot.loop)
         try:
             future.result()
         except Exception as callback_error:
-            print(f"Music queue callback failed: {callback_error}")
+            logging.error("Music queue callback failed: %s", callback_error)
 
-    voice.play(source, after=after_playback)
+    try:
+        voice.play(source, after=after_playback)
+    except Exception:
+        source.cleanup()
+        state["current"] = None
+        state["started_at"] = None
+        raise
+    bot_voice_state = guild.me.voice if guild and guild.me else None
+    voice_permissions = voice.channel.permissions_for(guild.me) if guild and guild.me and voice.channel else None
+    logging.warning(
+        "Music playback started title=%r stream_peak=%d voice_connected=%s channel=%s "
+        "can_speak=%s server_muted=%s self_muted=%s server_deafened=%s ffmpeg=%s",
+        track.get("title", "unknown track"), probe_peak, voice.is_connected(),
+        getattr(voice.channel, "id", None), getattr(voice_permissions, "speak", None),
+        getattr(bot_voice_state, "mute", None), getattr(bot_voice_state, "self_mute", None),
+        getattr(bot_voice_state, "deaf", None), ffmpeg_executable,
+    )
     await post_now_playing(guild_id)
+
+    async def log_voice_delivery_probe():
+        await asyncio.sleep(3)
+        player = voice._player
+        logging.warning(
+            "Music diagnostic: after 3s sent_voice_packets=%s source_frames_read=%s "
+            "playing=%s paused=%s connected=%s",
+            getattr(player, "loops", None), buffered_source.read_frames,
+            voice.is_playing(), voice.is_paused(), voice.is_connected(),
+        )
+
+    asyncio.create_task(log_voice_delivery_probe())
 
 
 async def advance_music(guild_id):
     state = get_music_state(guild_id)
     finished = state["current"]
     if finished and state["loop"] == "track":
-        await start_music_track(guild_id, finished, record_history=False, refresh_stream=True)
+        await start_music_track(guild_id, finished, record_history=False)
         return
     if finished and state["loop"] == "queue":
         state["queue"].append(finished)
@@ -921,7 +1589,7 @@ async def advance_music(guild_id):
     state["started_at"] = None
     while state["queue"]:
         try:
-            await start_music_track(guild_id, state["queue"].popleft(), refresh_stream=True)
+            await start_music_track(guild_id, state["queue"].popleft())
             return
         except Exception as error:
             print(f"Skipping unavailable queued track: {error}")
@@ -932,35 +1600,19 @@ async def extract_track(query, requester):
     global last_youtube_lookup
     loop = asyncio.get_running_loop()
     def extract():
-        options = YTDL_OPTIONS.copy()
-        source_cookies = options.get("cookiefile")
-        temporary_cookies = None
-        try:
-            if source_cookies:
-                fd, temporary_cookies = tempfile.mkstemp(prefix="yt-dlp-cookies-", suffix=".txt")
-                os.close(fd)
-                shutil.copyfile(source_cookies, temporary_cookies)
-                options["cookiefile"] = temporary_cookies
-            with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if "entries" in info:
-                    info = next((entry for entry in info["entries"] if entry), None)
-                if not info:
-                    raise ValueError("No playable result found")
-                return {
-                    "title": info.get("title", query),
-                    "stream_url": info["url"],
-                    "webpage_url": info.get("webpage_url", query),
-                    "duration": info.get("duration"),
-                    "thumbnail": info.get("thumbnail"),
-                    "requester": requester,
-                }
-        finally:
-            if temporary_cookies:
-                try:
-                    os.remove(temporary_cookies)
-                except FileNotFoundError:
-                    pass
+        options = get_ytdl_options()
+        info = extract_info_with_cookie_fallback(query, options, download=False)
+        if info and "entries" in info:
+            info = next((entry for entry in info["entries"] if entry), None)
+        if not info:
+            raise ValueError("No playable result found")
+        return {
+            "title": info.get("title", query),
+            "webpage_url": info.get("webpage_url", query),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "requester": requester,
+        }
     # Serialize lookups and leave breathing room between searches so multiple
     # queued requests do not immediately amplify YouTube's rate limiting.
     async with youtube_lookup_lock:
@@ -981,8 +1633,10 @@ async def add_music_request(ctx, query):
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("Join a voice channel first.")
         return
-    if ctx.interaction:
-        await ctx.defer()
+
+    # Send an initial response immediately so slash invocations never sit on
+    # Discord's deferred "thinking" indicator while yt-dlp downloads a track.
+    progress = await ctx.send("Joining voice and looking up the track…")
     guild_id = ctx.guild.id
     state = get_music_state(guild_id)
     voice = ctx.guild.voice_client
@@ -992,7 +1646,7 @@ async def add_music_request(ctx, query):
             voice = await ctx.author.voice.channel.connect()
         elif voice.channel != ctx.author.voice.channel:
             if voice.is_playing() or voice.is_paused():
-                await ctx.send(f"I'm already playing in **{voice.channel.name}**.")
+                await progress.edit(content=f"I'm already playing in **{voice.channel.name}**.")
                 return
             await voice.move_to(ctx.author.voice.channel)
         stage = "looking up the track with yt-dlp"
@@ -1000,33 +1654,40 @@ async def add_music_request(ctx, query):
         state["text_channel_id"] = ctx.channel.id
         if voice.is_playing() or voice.is_paused():
             state["queue"].append(track)
-            await ctx.send(f"Added **{discord.utils.escape_markdown(track['title'])}** to the queue (#{len(state['queue'])}).")
+            await progress.edit(content=f"Added **{discord.utils.escape_markdown(track['title'])}** to the queue (#{len(state['queue'])}).")
         else:
             state["offset"] = 0
-            stage = "starting audio"
+            stage = "opening the audio stream"
+            await progress.edit(content=f"Found **{discord.utils.escape_markdown(track['title'])}**. Preparing audio…")
             await start_music_track(guild_id, track)
+            await progress.edit(content=f"Started **{discord.utils.escape_markdown(track['title'])}**.")
     except Exception as error:
         detail = str(error).replace("\n", " ")[:300]
         logging.error("Music command failed during %s (%s): %s", stage, type(error).__name__, detail)
         if isinstance(error, RuntimeError) and "PyNaCl" in str(error):
-            message = "Voice support is missing PyNaCl. Install the requirements with `python -m pip install -U -r req.txt`."
+            message = "Voice support is missing PyNaCl. Install the project dependencies from `requirements.txt`."
         elif isinstance(error, RuntimeError) and "davey" in str(error).lower():
-            message = "Voice support is missing davey. Install the requirements with `python -m pip install -U -r req.txt`."
+            message = "Voice support is missing davey. Install the project dependencies from `requirements.txt`."
         elif stage == "looking up the track with yt-dlp":
             error_text = str(error).lower()
             if "429" in error_text or "too many requests" in error_text:
-                message = "YouTube is rate-limiting the bot host (HTTP 429). Wait before trying again; repeated requests or retries can extend the block."
+                message = "YouTube is rate-limiting the bot host (HTTP 429). Wait before trying again."
             elif "requested format is not available" in error_text:
-                message = "YouTube did not expose an audio format for this track through its current player clients. Try another track; this video may not be playable from the bot host right now."
+                message = "YouTube did not expose an audio format for this track. Try another track."
             elif "page needs to be reloaded" in error_text:
-                message = "YouTube rejected this request. Check that Render deployed the latest bot and yt-dlp nightly, then try again. If it persists, refresh the YouTube cookies secret; YouTube may block some tracks or hosting IPs."
-            elif "sign in to confirm" in error_text or "cookies" in error_text:
-                message = "YouTube requires an authenticated session for this track. Configure a private YouTube cookies file on the bot host; never share or commit that file."
+                message = "YouTube rejected this request from the bot host. Try again later or use another track."
+            elif "sign in to confirm" in error_text:
+                message = "YouTube blocked this track's anonymous request. Try another track or retry later."
+            elif "signature solving failed" in error_text or "challenge solving failed" in error_text:
+                message = "YouTube's playback challenge could not be solved. Install Deno 2.3+ or Node.js 22+ on the bot host, then restart it."
             else:
-                message = "yt-dlp couldn't resolve that track. Check that Deno 2.3+ is installed and review the bot log for details."
+                message = "yt-dlp couldn't resolve that track. Check that Deno 2.3+ or Node.js 22+ is available and review the bot log."
         else:
             message = f"Couldn't load the track while {stage} ({type(error).__name__}). See the bot log for details."
-        await ctx.send(message)
+        try:
+            await progress.edit(content=message)
+        except discord.HTTPException:
+            await ctx.send(message)
 
 
 @bot.hybrid_command(name="play", description="Play a song or add it to the queue")
@@ -1058,7 +1719,66 @@ async def nowplaying(ctx):
     if not ctx.guild:
         await ctx.send("Music works in a server voice channel.")
         return
-    await ctx.send(embed=now_playing_embed(get_music_state(ctx.guild.id)))
+    state = get_music_state(ctx.guild.id)
+    await ctx.send(embed=now_playing_embed(state), view=MusicControlView(ctx.guild.id) if state["current"] else None)
+
+
+async def previous_music_track(guild_id):
+    state = get_music_state(guild_id)
+    guild = bot.get_guild(guild_id)
+    voice = guild.voice_client if guild else None
+    if not state["history"] or not voice:
+        return "There isn't a previous track in the history yet."
+    previous_track = state["history"].pop()
+    if state["current"]:
+        state["queue"].appendleft(state["current"])
+    active = voice.is_playing() or voice.is_paused()
+    state["suppress_after"] = active
+    if active:
+        voice.stop()
+    state["offset"] = 0
+    await start_music_track(guild_id, previous_track, record_history=False)
+    return "⏮️ Playing the previous track."
+
+
+async def stop_music_state(guild_id):
+    state = get_music_state(guild_id)
+    guild = bot.get_guild(guild_id)
+    voice = guild.voice_client if guild else None
+    state["queue"].clear()
+    state["current"] = None
+    state["history"].clear()
+    state["offset"] = 0
+    state["paused"] = False
+    state["started_at"] = None
+    state["suppress_after"] = bool(voice and (voice.is_playing() or voice.is_paused()))
+    if voice:
+        if voice.is_playing() or voice.is_paused():
+            voice.stop()
+        await voice.disconnect()
+    return "⏹️ Stopped playback, cleared the queue, and left voice."
+
+
+async def seek_music_state(guild_id, delta, absolute=False):
+    state = get_music_state(guild_id)
+    guild = bot.get_guild(guild_id)
+    voice = guild.voice_client if guild else None
+    if not state["current"] or not voice or not (voice.is_playing() or voice.is_paused()):
+        return "Nothing is playing to seek."
+    elapsed = state["offset"]
+    if voice.is_playing() and state["started_at"] is not None:
+        elapsed += asyncio.get_running_loop().time() - state["started_at"]
+    duration = state["current"].get("duration")
+    new_offset = max(0, int(delta if absolute else elapsed + delta))
+    if duration:
+        new_offset = min(new_offset, max(0, int(duration) - 2))
+    state["offset"] = new_offset
+    current = state["current"]
+    state["suppress_after"] = True
+    voice.stop()
+    await start_music_track(guild_id, current, record_history=False)
+    icon = "⏪" if delta < 0 else "⏩"
+    return f"{icon} Moved to {format_duration(new_offset)}."
 
 
 @bot.hybrid_command(name="skip", description="Skip the current song")
@@ -1076,20 +1796,7 @@ async def previous(ctx):
     if not ctx.guild:
         await ctx.send("Music works in a server voice channel.")
         return
-    state = get_music_state(ctx.guild.id)
-    voice = ctx.guild.voice_client
-    if not state["history"] or not voice:
-        await ctx.send("There isn't a previous track in the history yet.")
-        return
-    previous_track = state["history"].pop()
-    if state["current"]:
-        state["queue"].appendleft(state["current"])
-    state["suppress_after"] = bool(voice.is_playing() or voice.is_paused())
-    if voice.is_playing() or voice.is_paused():
-        voice.stop()
-    state["offset"] = 0
-    await start_music_track(ctx.guild.id, previous_track, record_history=False, refresh_stream=True)
-    await ctx.send("⏮️ Playing the previous track.")
+    await ctx.send(await previous_music_track(ctx.guild.id))
 
 
 @bot.hybrid_command(name="pause", description="Pause music")
@@ -1100,6 +1807,7 @@ async def pause(ctx):
         state["offset"] += int(asyncio.get_running_loop().time() - state["started_at"])
         state["started_at"] = None
         voice.pause()
+        state["paused"] = True
         await ctx.send("⏸️ Paused.")
     else:
         await ctx.send("Nothing is playing to pause.")
@@ -1111,6 +1819,7 @@ async def resume(ctx):
     state = get_music_state(ctx.guild.id) if ctx.guild else None
     if voice and state and voice.is_paused():
         state["started_at"] = asyncio.get_running_loop().time()
+        state["paused"] = False
         voice.resume()
         await ctx.send("▶️ Resumed.")
     else:
@@ -1122,42 +1831,14 @@ async def stop(ctx):
     if not ctx.guild:
         await ctx.send("Music works in a server voice channel.")
         return
-    state = get_music_state(ctx.guild.id)
-    voice = ctx.guild.voice_client
-    state["queue"].clear()
-    state["current"] = None
-    state["history"].clear()
-    state["offset"] = 0
-    state["suppress_after"] = bool(voice and (voice.is_playing() or voice.is_paused()))
-    if voice:
-        voice.stop()
-        await voice.disconnect()
-    await ctx.send("⏹️ Stopped playback, cleared the queue, and left voice.")
+    await ctx.send(await stop_music_state(ctx.guild.id))
 
 
 async def seek_music(ctx, delta, absolute=False):
     if not ctx.guild:
         await ctx.send("Music works in a server voice channel.")
         return
-    state = get_music_state(ctx.guild.id)
-    voice = ctx.guild.voice_client
-    if not state["current"] or not voice or not (voice.is_playing() or voice.is_paused()):
-        await ctx.send("Nothing is playing to seek.")
-        return
-    elapsed = state["offset"]
-    if voice.is_playing() and state["started_at"] is not None:
-        elapsed += asyncio.get_running_loop().time() - state["started_at"]
-    duration = state["current"].get("duration")
-    new_offset = max(0, int(delta if absolute else elapsed + delta))
-    if duration:
-        new_offset = min(new_offset, max(0, int(duration) - 2))
-    state["offset"] = new_offset
-    current = state["current"]
-    state["suppress_after"] = True
-    voice.stop()
-    await start_music_track(ctx.guild.id, current, record_history=False, refresh_stream=True)
-    icon = "⏪" if delta < 0 else "⏩"
-    await ctx.send(f"{icon} Moved to {format_duration(new_offset)}.")
+    await ctx.send(await seek_music_state(ctx.guild.id, delta, absolute))
 
 
 @bot.hybrid_command(name="back", description="Rewind music by 10 seconds")
@@ -1267,6 +1948,8 @@ async def serverinfo(ctx):
     if not ctx.guild:
         await ctx.send("This command works in a server.")
         return
+    if ctx.interaction:
+        await ctx.defer(thinking=True)
     guild = ctx.guild
     members = guild.members
     humans = sum(not member.bot for member in members)
@@ -1303,6 +1986,8 @@ async def userinfo(ctx, member: discord.Member = None):
     if not ctx.guild:
         await ctx.send("This command works in a server.")
         return
+    if ctx.interaction:
+        await ctx.defer(thinking=True)
     member = member or ctx.author
     messages, reactions_given, reactions_removed, reactions_received = get_member_stats(ctx.guild.id, member.id)
     roles = [role.name for role in reversed(member.roles) if role != ctx.guild.default_role]
@@ -1484,15 +2169,19 @@ async def clearwarnings(ctx, member: discord.Member):
 @bot.hybrid_command(name="help", description="Show this bot's commands")
 async def help_command(ctx):
     embed = discord.Embed(title="Bot commands", color=discord.Color.blurple())
-    embed.add_field(name="Community", value="`/poll` · `/suggest` · `/remindme` · `/reminders` · `/cancelreminder`", inline=False)
-    embed.add_field(name="Server info", value="`/ping` · `/serverinfo` · `/userinfo` · `/fetch` · `/games`", inline=False)
-    embed.add_field(name="Moderation", value="`/purge` · `/warn` · `/warnings` · `/clearwarnings` · `/snipe`", inline=False)
-    embed.add_field(name="Music", value="`/play` · `/add` · `/queue` · `/nowplaying` · `/skip` · `/previous` · `/pause` · `/resume` · `/stop` · `/seek` · `/back` · `/forward` · `/volume` · `/shuffle` · `/remove` · `/clearqueue` · `/loop`", inline=False)
+    embed.description = "Use slash commands or prefix them with `!` (legacy `$` also works)."
+    embed.add_field(name="Community", value="`poll` · `suggest` · `remindme` · `reminders` · `cancelreminder`", inline=False)
+    embed.add_field(name="Server info", value="`ping` · `serverinfo` · `userinfo` · `fetch` · `games` · `duel`", inline=False)
+    embed.add_field(name="Moderation", value="`purge` · `warn` · `warnings` · `clearwarnings` · `snipe`", inline=False)
+    embed.add_field(name="Music", value="`play` · `add` · `queue` · `nowplaying` · `skip` · `previous` · `pause` · `resume` · `stop` · `seek` · `back` · `forward` · `volume` · `shuffle` · `remove` · `clearqueue` · `loop`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="catch")
 async def catch(ctx):
     await snipe(ctx)
 
-bot.run(token)
-discord.utils.setup_logging(level=logging.DEBUG)
+if __name__ == "__main__":
+    if not token:
+        raise RuntimeError("Set DISCORD_TOKEN in the environment before starting the bot")
+    discord.utils.setup_logging(level=logging.INFO)
+    bot.run(token)

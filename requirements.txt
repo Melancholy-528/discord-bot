@@ -1,0 +1,6 @@
+discord.py[voice]
+python-dotenv
+better-profanity
+yt-dlp[default]
+imageio-ffmpeg
+Pillow
