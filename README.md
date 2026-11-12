@@ -2,7 +2,7 @@
 
 ## Deploy on Wispbyte
 
-1. Choose the Python runtime and upload the project files, including `main.py`, `install_deno.py`, and `requirements.txt` (or `req.txt` if your startup command uses that filename).
+1. Choose the Python runtime and upload the full project, including `main.py`, `bot_state.py`, `events.py`, `games.py`, `music.py`, `profiles.py`, `community.py`, `moderation.py`, `help_commands.py`, `install_deno.py`, and `requirements.txt` (or `req.txt` if your startup command uses that filename).
 2. Set the Wispbyte startup command to install Deno with Python's built-in ZIP support, expose it on `PATH`, install Python dependencies, then start the bot:
 
    ```sh
@@ -15,6 +15,13 @@
 5. Enable **Message Content**, **Server Members**, and **Presence** intents for the bot in the Discord Developer Portal. Prefix commands need Message Content Intent.
 
 This is a Discord gateway bot, so it does not need an HTTP server or an allocated public port. Music normally uses a remote audio stream; when a YouTube cookies file is configured, yt-dlp downloads authenticated audio to a temporary file that is removed when playback ends. The included `imageio-ffmpeg` package supplies FFmpeg if the host does not provide a system FFmpeg.
+
+## Project modules
+
+- `main.py` starts the bot and imports feature modules.
+- `bot_state.py` owns the Discord client, shared state, database setup, and common helpers.
+- `events.py`, `games.py`, and `music.py` contain message events, games, and music features.
+- `profiles.py`, `community.py`, `moderation.py`, and `help_commands.py` contain profile, community, moderation, and help commands.
 
 ### YouTube JavaScript runtime
 
